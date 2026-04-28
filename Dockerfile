@@ -1,30 +1,41 @@
-FROM nvidia/cudagl:9.0-devel-ubuntu16.04
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Essentials: developer tools, build tools, OpenBLAS
 RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-utils git curl vim unzip openssh-client wget \
-    build-essential cmake \
+    build-essential cmake ninja-build \
     libopenblas-dev \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev
+    libxrender-dev \
+    libgl1 \
+    # Python 3.10 is the default on Ubuntu 22.04
+    python3.10 python3.10-dev python3-pip python3-tk && \
+    ln -sf /usr/bin/python3.10 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
+    echo "alias pip='pip3'" >> /root/.bashrc
 
-# Python 3.5
-RUN apt-get update && apt-get install -y --no-install-recommends python3.5 python3.5-dev python3-pip python3-tk && \
-    pip3 install --no-cache-dir --upgrade pip setuptools && \
-    echo "alias python='python3'" >> /root/.bash_aliases && \
-    echo "alias pip='pip3'" >> /root/.bash_aliases
+# Science libraries
+RUN pip3 install --no-cache-dir \
+    "numpy<2" \
+    scipy \
+    pyyaml \
+    cffi \
+    matplotlib \
+    Cython \
+    requests \
+    opencv-python \
+    pillow
 
-# Science libraries and other common packages
-RUN pip3 --no-cache-dir install \
-    numpy scipy pyyaml cffi pyyaml matplotlib Cython requests opencv-python "pillow<7"
-
-# Tensorflow
-RUN pip3 install https://download.pytorch.org/whl/cu90/torch-0.4.1-cp35-cp35m-linux_x86_64.whl && \
-    pip3 install torchvision==0.2.2.post3
+# PyTorch 2.x for CUDA 11.8
+RUN pip3 install --no-cache-dir \
+    torch==2.1.0+cu118 \
+    torchvision==0.16.0+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
 
 # Expose port for TensorBoard
 EXPOSE 6006
