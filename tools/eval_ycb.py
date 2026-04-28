@@ -19,7 +19,6 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 import torch.nn.functional as F
-from torch.autograd import Variable
 from datasets.ycb.dataset import PoseDataset
 from lib.network import PoseNet, PoseRefineNet
 from lib.transformations import euler_matrix, quaternion_matrix, quaternion_from_matrix
@@ -181,10 +180,10 @@ for now in range(0, 2949):
             img_masked = norm(torch.from_numpy(img_masked.astype(np.float32)))
             index = torch.LongTensor([itemid - 1])
 
-            cloud = Variable(cloud).cuda()
-            choose = Variable(choose).cuda()
-            img_masked = Variable(img_masked).cuda()
-            index = Variable(index).cuda()
+            cloud = cloud.cuda()
+            choose = choose.cuda()
+            img_masked = img_masked.cuda()
+            index = index.cuda()
 
             cloud = cloud.view(1, num_points, 3)
             img_masked = img_masked.view(1, 3, img_masked.size()[1], img_masked.size()[2])
@@ -203,9 +202,9 @@ for now in range(0, 2949):
             my_result_wo_refine.append(my_pred.tolist())
 
             for ite in range(0, iteration):
-                T = Variable(torch.from_numpy(my_t.astype(np.float32))).cuda().view(1, 3).repeat(num_points, 1).contiguous().view(1, num_points, 3)
+                T = torch.from_numpy(my_t.astype(np.float32)).cuda().view(1, 3).repeat(num_points, 1).contiguous().view(1, num_points, 3)
                 my_mat = quaternion_matrix(my_r)
-                R = Variable(torch.from_numpy(my_mat[:3, :3].astype(np.float32))).cuda().view(1, 3, 3)
+                R = torch.from_numpy(my_mat[:3, :3].astype(np.float32)).cuda().view(1, 3, 3)
                 my_mat[0:3, 3] = my_t
                 
                 new_cloud = torch.bmm((cloud - T), R).contiguous()
