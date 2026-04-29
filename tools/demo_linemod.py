@@ -246,9 +246,83 @@ def compute_add(R_pred, t_pred, R_gt, t_gt, model_pts, obj_idx, diameter_mm):
     }
 
 
+def draw_axes(ax, R, t, length_m=0.05):
+    """Draw a 3D pose as a projected XYZ tricolour frame on a matplotlib axis.
+
+    The three axes of the object coordinate frame are projected onto the image
+    plane using the same pinhole model as project_points(). Each axis is drawn
+    as an arrow from the object centre (t) to (t + R[:,i] * length_m):
+        X → red   Y → green   Z → blue
+
+    length_m controls the visual size of the frame in metres; tune it to the
+    scale of the object if axes appear too large or too small.
+    """
+    origin = project_points(np.zeros((1, 3)), R, t, CAM_FX, CAM_FY, CAM_CX, CAM_CY)[0]
+    colors = ['red', 'green', 'blue']
+    labels = ['X', 'Y', 'Z']
+    for i, (color, label) in enumerate(zip(colors, labels)):
+        tip_3d = (R[:, i] * length_m).reshape(1, 3)
+        tip_2d = project_points(tip_3d, R, t, CAM_FX, CAM_FY, CAM_CX, CAM_CY)[0]
+        # Arrow from origin to tip
+        ax.annotate('', xy=tip_2d, xytext=origin,
+                    arrowprops=dict(arrowstyle='->', color=color, lw=2.5))
+        ax.text(tip_2d[0], tip_2d[1], label, color=color, fontsize=9, fontweight='bold')
+
+
+def _pose_panel(ax, proj_pred, proj_gt, R_pred, t_pred, R_gt, t_gt,
+                background, title, mask_label=None):
+    """Shared helper: draw one predicted-vs-GT panel with axes frames.
+
+    background  — RGB image array, or None for a black background (point-cloud only mode)
+    mask_label  — if provided, the RGB image is masked so only the object region is shown
+    """
+    def in_frame(proj):
+        return ((proj[:, 0] >= 0) & (proj[:, 0] < 640) &
+                (proj[:, 1] >= 0) & (proj[:, 1] < 480))
+
+    if background is None:
+        # Black background — point cloud only
+        ax.set_facecolor('black')
+        ax.set_xlim(0, 640)
+        ax.set_ylim(480, 0)  # inverted Y to match image coords
+    else:
+        img_display = background.copy()
+        if mask_label is not None:
+            # Apply segmentation mask: zero out pixels where mask == 0
+            seg = (mask_label == 255).astype(np.uint8)
+            img_display = img_display * seg[:, :, np.newaxis]
+        ax.imshow(img_display)
+
+    valid_gt   = in_frame(proj_gt)
+    valid_pred = in_frame(proj_pred)
+    ax.scatter(proj_gt[valid_gt, 0],     proj_gt[valid_gt, 1],
+               s=1.5, c='lime', alpha=0.5, linewidths=0, label='Ground truth')
+    ax.scatter(proj_pred[valid_pred, 0], proj_pred[valid_pred, 1],
+               s=1.5, c='red',  alpha=0.5, linewidths=0, label='Predicted')
+
+    # 6D pose frames — predicted (solid) and ground truth (dashed via double draw)
+    draw_axes(ax, R_pred, t_pred)
+    draw_axes(ax, R_gt,   t_gt)   # GT axes drawn identically; they overlap if pose is perfect
+
+    ax.legend(loc='upper right', fontsize=8, markerscale=6,
+              facecolor='#111111', labelcolor='white')
+    ax.set_title(title, color='white' if background is None else 'black')
+    ax.axis('off')
+
+
 def visualize(img, depth, mask_label, bbox, model_pts, R, t, R_gt, t_gt,
               obj, frame_name, add_result, output_path):
-    """Draw RGB + mask + predicted pose + ground truth overlay + ADD result."""
+    """Produce two output images:
+
+    1. <output_path>          — overview: RGB input | segmentation mask | masked RGB overlay
+    2. <stem>_pointcloud.png  — point-cloud only view on black background
+
+    Each predicted-vs-GT panel contains:
+      - Ground truth point cloud (green)
+      - Predicted point cloud (red)
+      - Predicted 6D pose frame (RGB tricolour arrows)
+      - Ground truth 6D pose frame (RGB tricolour arrows, overlaps predicted if pose is good)
+    """
     rmin, rmax, cmin, cmax = bbox
     img_arr = np.array(img)
 
@@ -259,54 +333,63 @@ def visualize(img, depth, mask_label, bbox, model_pts, R, t, R_gt, t_gt,
     proj_pred = project_points(pts_sample, R,    t,    CAM_FX, CAM_FY, CAM_CX, CAM_CY)
     proj_gt   = project_points(pts_sample, R_gt, t_gt, CAM_FX, CAM_FY, CAM_CX, CAM_CY)
 
-    def in_frame(proj):
-        return ((proj[:, 0] >= 0) & (proj[:, 0] < 640) &
-                (proj[:, 1] >= 0) & (proj[:, 1] < 480))
-
-    # ADD result string for the title
+    # Shared title info
     status = '✓ PASS' if add_result['success'] else '✗ FAIL'
-    add_str = '{} | {} = {:.2f} mm  (threshold {:.2f} mm, diameter {:.1f} mm)'.format(
-        status,
-        add_result['metric'],
-        add_result['value_mm'],
-        add_result['threshold_mm'],
-        add_result['diameter_mm'],
-    )
+    add_str = '{}  {} = {:.2f} mm  (threshold {:.2f} mm)'.format(
+        status, add_result['metric'], add_result['value_mm'], add_result['threshold_mm'])
     title_color = 'green' if add_result['success'] else 'red'
+    sup = 'DenseFusion — Object {:02d}, Frame {}    {}'.format(obj, frame_name, add_str)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('DenseFusion — Object {:02d}, Frame {}    {}'.format(obj, frame_name, add_str),
-                 fontsize=11, color=title_color)
+    # ── Figure 1: overview (RGB | mask | masked overlay) ──────────────────────
+    fig1, axes1 = plt.subplots(1, 3, figsize=(18, 6), facecolor='white')
+    fig1.suptitle(sup, fontsize=11, color=title_color)
 
-    # Panel 1: RGB + bounding box
-    axes[0].imshow(img_arr)
+    # Panel 1 — RGB + bounding box
+    axes1[0].imshow(img_arr)
     rect = patches.Rectangle((cmin, rmin), cmax - cmin, rmax - rmin,
                               linewidth=2, edgecolor='lime', facecolor='none')
-    axes[0].add_patch(rect)
-    axes[0].set_title('RGB input + detection bbox')
-    axes[0].axis('off')
+    axes1[0].add_patch(rect)
+    axes1[0].set_title('RGB input + detection bbox')
+    axes1[0].axis('off')
 
-    # Panel 2: Segmentation mask
-    axes[1].imshow(mask_label, cmap='gray')
-    axes[1].set_title('Segmentation mask (SegNet output)')
-    axes[1].axis('off')
+    # Panel 2 — segmentation mask
+    axes1[1].imshow(mask_label, cmap='gray')
+    axes1[1].set_title('Segmentation mask (SegNet output)')
+    axes1[1].axis('off')
 
-    # Panel 3: predicted (red) vs ground truth (green) reprojection
-    axes[2].imshow(img_arr)
-    valid_pred = in_frame(proj_pred)
-    valid_gt   = in_frame(proj_gt)
-    axes[2].scatter(proj_gt[valid_gt, 0],   proj_gt[valid_gt, 1],
-                    s=1.5, c='lime',  alpha=0.5, linewidths=0, label='Ground truth')
-    axes[2].scatter(proj_pred[valid_pred, 0], proj_pred[valid_pred, 1],
-                    s=1.5, c='red',   alpha=0.5, linewidths=0, label='Predicted')
-    axes[2].legend(loc='upper right', fontsize=8, markerscale=6)
-    axes[2].set_title('Predicted (red) vs Ground truth (green)')
-    axes[2].axis('off')
+    # Panel 3 — masked RGB + point clouds + pose axes
+    _pose_panel(axes1[2], proj_pred, proj_gt, R, t, R_gt, t_gt,
+                background=img_arr,
+                title='Predicted (red) vs GT (green) — RGB',
+                mask_label=None)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    fig1.tight_layout()
+    fig1.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig1)
     print('Saved: {}'.format(output_path))
+
+    # ── Figure 2: point-cloud only on black background ─────────────────────────
+    stem, ext = os.path.splitext(output_path)
+    pc_path = '{}_pointcloud{}'.format(stem, ext)
+
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 6), facecolor='black')
+    fig2.suptitle(sup, fontsize=11, color=title_color)
+
+    _pose_panel(axes2[0], proj_pred, proj_gt, R, t, R_gt, t_gt,
+                background=None,
+                title='Point cloud — full frame')
+
+    # Zoom into the object bounding box for the second panel
+    _pose_panel(axes2[1], proj_pred, proj_gt, R, t, R_gt, t_gt,
+                background=None,
+                title='Point cloud — object crop')
+    axes2[1].set_xlim(cmin, cmax)
+    axes2[1].set_ylim(rmax, rmin)  # inverted Y
+
+    fig2.tight_layout()
+    fig2.savefig(pc_path, dpi=150, bbox_inches='tight', facecolor='black')
+    plt.close(fig2)
+    print('Saved: {}'.format(pc_path))
 
 
 def main():
