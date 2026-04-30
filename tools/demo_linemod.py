@@ -194,68 +194,91 @@ def load_ground_truth(dataset_root, obj, frame_name):
     return R_gt, t_gt
 
 
-def compute_add(R_pred, t_pred, R_gt, t_gt, model_pts, obj_idx, diameter_mm):
-    """Compute the ADD (or ADD-S for symmetric objects) metric.
+def compute_pose_metrics(R_pred, t_pred, R_gt, t_gt, model_pts, obj_idx, diameter_mm):
+    """Compute three complementary pose error metrics.
 
-    ADD — Average Distance of Model Points:
-        For each point p in the 3D model, compute the distance between
-        its position under the predicted pose and its position under the
-        ground truth pose, then average across all points.
+    ── 1. ADD / ADD-S (Average Distance of Model Points) ────────────────────
+    The standard LineMOD protocol. Transforms every point of the 3D model
+    under both poses and averages the point-to-point distances.
 
-            ADD = mean_p || (R_pred @ p + t_pred) - (R_gt @ p + t_gt) ||
+        ADD  = mean_p || (R_pred @ p + t_pred) - (R_gt @ p + t_gt) ||
 
-    ADD-S (symmetric variant):
-        For symmetric objects the correspondence is ambiguous, so instead
-        of comparing point-to-point we compare each predicted point to its
-        nearest neighbour in the ground truth point cloud.
+    For symmetric objects (ADD-S), nearest-neighbour matching is used instead
+    of point-to-point so that rotationally equivalent poses score equally.
 
-            ADD-S = mean_p  min_q || (R_pred @ p + t_pred) - (R_gt @ q + t_gt) ||
+        ADD-S = mean_p  min_q || (R_pred @ p + t_pred) - (R_gt @ q + t_gt) ||
 
-    Threshold: a pose is considered correct if ADD (or ADD-S) < 10% of
-    the object's diameter. This is the standard LineMOD evaluation protocol
-    used in eval_linemod.py line 132.
+    A pose is correct if ADD (or ADD-S) < 10% of the object's diameter.
+    Source: eval_linemod.py lines 119-132.
 
-    Source: eval_linemod.py lines 119-132 + models_info.yml for diameter.
+    ── 2. Geodesic rotation error ───────────────────────────────────────────
+    Measures the angular distance between two rotation matrices on SO(3),
+    i.e. the angle of the residual rotation R_rel = R_pred^T @ R_gt.
+
+        θ = arccos( (trace(R_rel) - 1) / 2 )
+
+    This is the shortest rotation on the unit sphere that maps R_pred onto
+    R_gt. It is independent of the translation and of the object's scale,
+    which makes it the most direct measure of orientation accuracy.
+    Unit: degrees. A perfect prediction gives θ = 0°.
+
+    ── 3. Euclidean translation error ───────────────────────────────────────
+    The L2 norm between the predicted and ground truth translation vectors.
+
+        d = || t_pred - t_gt ||
+
+    Pure distance in 3D camera space, independent of rotation.
+    Unit: millimetres.
     """
+    from scipy.spatial.distance import cdist
+
     pts = model_pts / 1000.0  # mm → m
 
+    # ── ADD / ADD-S ──────────────────────────────────────────────────────────
     pred_cloud = (R_pred @ pts.T).T + t_pred  # [N, 3]
     gt_cloud   = (R_gt   @ pts.T).T + t_gt    # [N, 3]
 
     if obj_idx in SYM_LIST:
-        # ADD-S: nearest-neighbour matching via cdist
-        from scipy.spatial.distance import cdist
         dists = cdist(pred_cloud, gt_cloud)
-        add = dists.min(axis=1).mean()
+        add   = dists.min(axis=1).mean()
         metric_name = 'ADD-S'
     else:
-        # ADD: point-to-point
         add = np.linalg.norm(pred_cloud - gt_cloud, axis=1).mean()
         metric_name = 'ADD'
 
-    diameter_m    = diameter_mm / 1000.0
-    threshold     = diameter_m * 0.1
-    success       = add < threshold
+    diameter_m = diameter_mm / 1000.0
+    threshold  = diameter_m * 0.1
+    add_success = add < threshold
+
+    # ── Geodesic rotation error ──────────────────────────────────────────────
+    # R_rel maps R_gt onto R_pred: R_pred = R_rel @ R_gt  =>  R_rel = R_pred^T @ R_gt
+    # clamp trace to [-1, 3] to guard against floating-point drift outside arccos domain
+    R_rel = R_pred.T @ R_gt
+    trace = np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0)
+    geodesic_deg = np.degrees(np.arccos(trace))
+
+    # ── Euclidean translation error ──────────────────────────────────────────
+    euclidean_mm = np.linalg.norm(t_pred - t_gt) * 1000.0
 
     return {
-        'metric':       metric_name,
-        'value_mm':     add * 1000.0,
-        'threshold_mm': threshold * 1000.0,
-        'diameter_mm':  diameter_mm,
-        'success':      success,
+        # ADD / ADD-S
+        'add_metric':      metric_name,
+        'add_value_mm':    add * 1000.0,
+        'add_threshold_mm': threshold * 1000.0,
+        'diameter_mm':     diameter_mm,
+        'add_success':     add_success,
+        # Geodesic
+        'geodesic_deg':    geodesic_deg,
+        # Euclidean translation
+        'euclidean_mm':    euclidean_mm,
     }
 
 
-def draw_axes(ax, R, t, length_m=0.05):
+def draw_axes(ax, R, t, length_m=0.05, scale=1.0):
     """Draw a 3D pose as a projected XYZ tricolour frame on a matplotlib axis.
 
-    The three axes of the object coordinate frame are projected onto the image
-    plane using the same pinhole model as project_points(). Each axis is drawn
-    as an arrow from the object centre (t) to (t + R[:,i] * length_m):
-        X → red   Y → green   Z → blue
-
-    length_m controls the visual size of the frame in metres; tune it to the
-    scale of the object if axes appear too large or too small.
+    length_m controls the physical size of the frame in metres.
+    scale multiplies the arrow length in screen space — use <1 for zoomed panels.
     """
     origin = project_points(np.zeros((1, 3)), R, t, CAM_FX, CAM_FY, CAM_CX, CAM_CY)[0]
     colors = ['red', 'green', 'blue']
@@ -263,50 +286,62 @@ def draw_axes(ax, R, t, length_m=0.05):
     for i, (color, label) in enumerate(zip(colors, labels)):
         tip_3d = (R[:, i] * length_m).reshape(1, 3)
         tip_2d = project_points(tip_3d, R, t, CAM_FX, CAM_FY, CAM_CX, CAM_CY)[0]
-        # Arrow from origin to tip
+        # Apply scale around origin
+        tip_2d = origin + (tip_2d - origin) * scale
         ax.annotate('', xy=tip_2d, xytext=origin,
                     arrowprops=dict(arrowstyle='->', color=color, lw=2.5))
         ax.text(tip_2d[0], tip_2d[1], label, color=color, fontsize=9, fontweight='bold')
 
 
 def _pose_panel(ax, proj_pred, proj_gt, R_pred, t_pred, R_gt, t_gt,
-                background, title, mask_label=None):
+                background, title, mask_label=None, axes_scale=1.0):
     """Shared helper: draw one predicted-vs-GT panel with axes frames.
 
-    background  — RGB image array, or None for a black background (point-cloud only mode)
-    mask_label  — if provided, the RGB image is masked so only the object region is shown
+    background  — RGB image array (shown with optional mask), or None for black bg
+    mask_label  — boolean array [H, W]; True pixels belong to the object.
+                  Pixels where mask is False are set to white, isolating the object.
+    axes_scale  — multiplier on arrow screen length; use ~0.3 for zoomed crop panels
+                  to avoid arrows overflowing outside the object area.
+
+    Legend and title colours adapt automatically to the background:
+    dark theme when background=None, light theme when an image is shown.
     """
     def in_frame(proj):
         return ((proj[:, 0] >= 0) & (proj[:, 0] < 640) &
                 (proj[:, 1] >= 0) & (proj[:, 1] < 480))
 
-    if background is None:
-        # Black background — point cloud only
+    dark_bg = (background is None)
+
+    if dark_bg:
         ax.set_facecolor('black')
         ax.set_xlim(0, 640)
-        ax.set_ylim(480, 0)  # inverted Y to match image coords
+        ax.set_ylim(480, 0)
     else:
-        img_display = background.copy()
+        ax.set_facecolor('white')
+        img_display = background.copy().astype(np.float32)
         if mask_label is not None:
-            # Apply segmentation mask: zero out pixels where mask == 0
-            seg = (mask_label == 255).astype(np.uint8)
-            img_display = img_display * seg[:, :, np.newaxis]
-        ax.imshow(img_display)
+            # mask_label is a boolean array: True = object pixel
+            seg = mask_label.astype(np.float32)
+            img_display = (img_display * seg[:, :, np.newaxis] +
+                           255.0 * (1.0 - seg[:, :, np.newaxis]))
+        # extent aligns imshow pixels with scatter/annotation pixel coordinates
+        ax.imshow(img_display.astype(np.uint8), extent=[0, 640, 480, 0])
 
     valid_gt   = in_frame(proj_gt)
     valid_pred = in_frame(proj_pred)
     ax.scatter(proj_gt[valid_gt, 0],     proj_gt[valid_gt, 1],
-               s=1.5, c='lime', alpha=0.5, linewidths=0, label='Ground truth')
+               s=2.5, c='lime', alpha=0.7, linewidths=0, label='Ground truth', zorder=3)
     ax.scatter(proj_pred[valid_pred, 0], proj_pred[valid_pred, 1],
-               s=1.5, c='red',  alpha=0.5, linewidths=0, label='Predicted')
+               s=2.5, c='red',  alpha=0.7, linewidths=0, label='Predicted',     zorder=3)
 
-    # 6D pose frames — predicted (solid) and ground truth (dashed via double draw)
-    draw_axes(ax, R_pred, t_pred)
-    draw_axes(ax, R_gt,   t_gt)   # GT axes drawn identically; they overlap if pose is perfect
+    draw_axes(ax, R_pred, t_pred, scale=axes_scale)
+    draw_axes(ax, R_gt,   t_gt,   scale=axes_scale)
 
+    legend_fc = '#111111' if dark_bg else 'white'
+    legend_lc = 'white'   if dark_bg else 'black'
     ax.legend(loc='upper right', fontsize=8, markerscale=6,
-              facecolor='#111111', labelcolor='white')
-    ax.set_title(title, color='white' if background is None else 'black')
+              facecolor=legend_fc, labelcolor=legend_lc, edgecolor='gray')
+    ax.set_title(title, color='white' if dark_bg else 'black')
     ax.axis('off')
 
 
@@ -334,10 +369,20 @@ def visualize(img, depth, mask_label, bbox, model_pts, R, t, R_gt, t_gt,
     proj_gt   = project_points(pts_sample, R_gt, t_gt, CAM_FX, CAM_FY, CAM_CX, CAM_CY)
 
     # Shared title info
-    status = '✓ PASS' if add_result['success'] else '✗ FAIL'
-    add_str = '{}  {} = {:.2f} mm  (threshold {:.2f} mm)'.format(
-        status, add_result['metric'], add_result['value_mm'], add_result['threshold_mm'])
-    title_color = 'green' if add_result['success'] else 'red'
+    status = '✓ PASS' if add_result['add_success'] else '✗ FAIL'
+    add_str = (
+        '{}  {} = {:.2f} mm (thr {:.2f} mm)  |  '
+        'Geodesic = {:.2f}°  |  '
+        'Euclidean = {:.2f} mm'
+    ).format(
+        status,
+        add_result['add_metric'],
+        add_result['add_value_mm'],
+        add_result['add_threshold_mm'],
+        add_result['geodesic_deg'],
+        add_result['euclidean_mm'],
+    )
+    title_color = 'green' if add_result['add_success'] else 'red'
     sup = 'DenseFusion — Object {:02d}, Frame {}    {}'.format(obj, frame_name, add_str)
 
     # ── Figure 1: overview (RGB | mask | masked overlay) ──────────────────────
@@ -372,22 +417,24 @@ def visualize(img, depth, mask_label, bbox, model_pts, R, t, R_gt, t_gt,
     stem, ext = os.path.splitext(output_path)
     pc_path = '{}_pointcloud{}'.format(stem, ext)
 
-    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 6), facecolor='black')
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 6), facecolor='white')
     fig2.suptitle(sup, fontsize=11, color=title_color)
 
     _pose_panel(axes2[0], proj_pred, proj_gt, R, t, R_gt, t_gt,
-                background=None,
-                title='Point cloud — full frame')
+                background=img_arr,
+                title='Predicted (red) vs GT (green) — full frame',
+                mask_label=mask_label)
 
-    # Zoom into the object bounding box for the second panel
     _pose_panel(axes2[1], proj_pred, proj_gt, R, t, R_gt, t_gt,
-                background=None,
-                title='Point cloud — object crop')
+                background=img_arr,
+                title='Predicted (red) vs GT (green) — object crop',
+                mask_label=mask_label,
+                axes_scale=0.3)
     axes2[1].set_xlim(cmin, cmax)
-    axes2[1].set_ylim(rmax, rmin)  # inverted Y
+    axes2[1].set_ylim(rmax, rmin)
 
     fig2.tight_layout()
-    fig2.savefig(pc_path, dpi=150, bbox_inches='tight', facecolor='black')
+    fig2.savefig(pc_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig2)
     print('Saved: {}'.format(pc_path))
 
@@ -449,19 +496,20 @@ def main():
         models_info = yaml.load(f, Loader=yaml.SafeLoader)
     diameter_mm = models_info[opt.obj]['diameter']
 
-    # Compute ADD / ADD-S
-    add_result = compute_add(R, t, R_gt, t_gt, model_pts, obj_idx, diameter_mm)
-    print('\n── ADD Result ──────────────────────────────')
-    print('Metric:    {}'.format(add_result['metric']))
-    print('Value:     {:.2f} mm'.format(add_result['value_mm']))
-    print('Threshold: {:.2f} mm  (10% of {:.1f} mm diameter)'.format(
-        add_result['threshold_mm'], add_result['diameter_mm']))
-    print('Result:    {}'.format('PASS ✓' if add_result['success'] else 'FAIL ✗'))
-    print('────────────────────────────────────────────\n')
+    # Compute all pose metrics
+    metrics = compute_pose_metrics(R, t, R_gt, t_gt, model_pts, obj_idx, diameter_mm)
+    print('\n── Pose Metrics ────────────────────────────────────────────────')
+    print('{:<12} {:<10} {:.2f} mm   (threshold {:.2f} mm, diameter {:.1f} mm)  →  {}'.format(
+        metrics['add_metric'] + ':', 'value',
+        metrics['add_value_mm'], metrics['add_threshold_mm'], metrics['diameter_mm'],
+        'PASS ✓' if metrics['add_success'] else 'FAIL ✗'))
+    print('{:<12} {:<10} {:.4f}°'.format('Geodesic:', 'rotation', metrics['geodesic_deg']))
+    print('{:<12} {:<10} {:.2f} mm'.format('Euclidean:', 'translation', metrics['euclidean_mm']))
+    print('────────────────────────────────────────────────────────────────\n')
 
     # Visualize
     visualize(img, depth, mask_label, bbox, model_pts, R, t, R_gt, t_gt,
-              opt.obj, frame_name, add_result, opt.output)
+              opt.obj, frame_name, metrics, opt.output)
 
 
 if __name__ == '__main__':
