@@ -46,6 +46,14 @@ parser.add_argument('--speed',        type=float, default=1.0,
                          'values >1.0 fast-forward. Implemented by scaling '
                          'the per-frame repeat count, so the encoded framerate '
                          '(--fps) stays fixed.')
+parser.add_argument('--output_format', type=str, default='video',
+                    choices=['video', 'frames', 'both'],
+                    help="What to save in the output directory: 'video' "
+                         "(default) writes a single livefeed.mp4; 'frames' "
+                         "writes one PNG per processed test frame inside a "
+                         "frames/ subdirectory; 'both' writes both. PNG "
+                         "filenames use the original LineMOD frame id "
+                         "(frame_XXXX.png) so they line up with the dataset.")
 parser.add_argument('--verbose',      action='store_true',
                     help='Print per-frame logs during evaluation loop')
 opt = parser.parse_args()
@@ -117,40 +125,60 @@ for frame_i, fname in enumerate(frame_names):
         frame_i + 1, len(frame_names), t_total,
         add_val * 1000, 'PASS' if success else 'FAIL'))
 
-# ── Save video ────────────────────────────────────────────────────────────────
-# Encoding strategy — fixed-framerate playback at the dataset's native capture
-# rate (--fps, default 30 = Kinect v1). The HUD's inference-time fps reading
-# does *not* drive playback speed; the writer fps does. The test split removes
-# frames reserved for training, so each kept frame is held for
-# (next_id - cur_id) output frames, preserving the original wall-clock timeline.
-# --speed scales those repeat counts (speed < 1 slows the video down, > 1 fast-
-# forwards) without changing the encoded framerate, which keeps the file valid
-# in every player.
-video_path = os.path.join(out_dir, 'livefeed.mp4')
-h, w = video_frames[0].shape[:2]
-writer = cv2.VideoWriter(video_path,
-    cv2.VideoWriter_fourcc(*'mp4v'), opt.fps, (w, h))
+# ── Save outputs ──────────────────────────────────────────────────────────────
+# Two independent deliverables, controlled by --output_format:
+#   * video  → a single livefeed.mp4 (writer-fps fixed, see below)
+#   * frames → one PNG per processed test frame, named after the original
+#              LineMOD frame id so they cross-reference the dataset cleanly.
+#              No duplication is applied — one input frame = one PNG.
+#
+# Video encoding strategy — fixed-framerate playback at the dataset's native
+# capture rate (--fps, default 30 = Kinect v1). The HUD's inference-time fps
+# reading does *not* drive playback speed; the writer fps does. The test split
+# removes frames reserved for training, so each kept frame is held for
+# (next_id - cur_id) output frames, preserving the original wall-clock
+# timeline. --speed scales those repeat counts (speed < 1 slows the video
+# down, > 1 fast-forwards) without changing the encoded framerate, which
+# keeps the file valid in every player.
+want_video  = opt.output_format in ('video', 'both')
+want_frames = opt.output_format in ('frames', 'both')
 
-# Accumulate fractional repeats so a non-integer speed multiplier still
-# converges to the right total duration over the whole sequence (no
-# systematic drift from rounding each frame independently).
-n_written        = 0
-repeat_carry     = 0.0
-for i, frame in enumerate(video_frames):
-    if i + 1 < len(video_ids):
-        native_gap = max(1, video_ids[i + 1] - video_ids[i])
-    else:
-        native_gap = 1
-    target       = native_gap / opt.speed + repeat_carry
-    repeats      = max(1, int(round(target)))
-    repeat_carry = target - repeats
-    for _ in range(repeats):
-        writer.write(frame)
-    n_written += repeats
-writer.release()
-duration_s = n_written / float(opt.fps)
-print('Video saved: {} ({} frames @ {} fps = {:.1f}s, speed x{:.2f})'.format(
-    video_path, n_written, opt.fps, duration_s, opt.speed))
+if want_frames:
+    frames_dir = os.path.join(out_dir, 'frames')
+    os.makedirs(frames_dir, exist_ok=True)
+    for frame, fid in zip(video_frames, video_ids):
+        # frame is BGR (cv2 convention) — cv2.imwrite expects BGR, so no
+        # colour conversion is needed.
+        png_path = os.path.join(frames_dir, 'frame_{:04d}.png'.format(fid))
+        cv2.imwrite(png_path, frame)
+    print('Frames saved: {} PNGs in {}'.format(len(video_frames), frames_dir))
+
+if want_video:
+    video_path = os.path.join(out_dir, 'livefeed.mp4')
+    h, w = video_frames[0].shape[:2]
+    writer = cv2.VideoWriter(video_path,
+        cv2.VideoWriter_fourcc(*'mp4v'), opt.fps, (w, h))
+
+    # Accumulate fractional repeats so a non-integer speed multiplier still
+    # converges to the right total duration over the whole sequence (no
+    # systematic drift from rounding each frame independently).
+    n_written        = 0
+    repeat_carry     = 0.0
+    for i, frame in enumerate(video_frames):
+        if i + 1 < len(video_ids):
+            native_gap = max(1, video_ids[i + 1] - video_ids[i])
+        else:
+            native_gap = 1
+        target       = native_gap / opt.speed + repeat_carry
+        repeats      = max(1, int(round(target)))
+        repeat_carry = target - repeats
+        for _ in range(repeats):
+            writer.write(frame)
+        n_written += repeats
+    writer.release()
+    duration_s = n_written / float(opt.fps)
+    print('Video saved: {} ({} frames @ {} fps = {:.1f}s, speed x{:.2f})'.format(
+        video_path, n_written, opt.fps, duration_s, opt.speed))
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 t_tot        = np.array(t_est_seq) + np.array(t_ref_seq)
