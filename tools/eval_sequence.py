@@ -33,6 +33,19 @@ parser.add_argument('--refine_model', type=str, required=True)
 parser.add_argument('--obj',          type=int, required=True,
                     help='Object ID (1,2,4,5,6,8,9,10,11,12,13,14,15)')
 parser.add_argument('--output_dir',   type=str, default='demo_out')
+parser.add_argument('--fps',          type=int, default=30,
+                    help='Output video framerate. Defaults to 30, the native '
+                         'LineMOD capture rate (Kinect v1). The test split '
+                         'skips frames reserved for training, so each kept '
+                         'frame is held across the gap to preserve the '
+                         'original wall-clock timeline.')
+parser.add_argument('--speed',        type=float, default=1.0,
+                    help='Playback speed multiplier relative to the native '
+                         'camera timing. 1.0 = real time (default). Values '
+                         '<1.0 slow the video down (e.g. 0.5 = half speed); '
+                         'values >1.0 fast-forward. Implemented by scaling '
+                         'the per-frame repeat count, so the encoded framerate '
+                         '(--fps) stays fixed.')
 parser.add_argument('--verbose',      action='store_true',
                     help='Print per-frame logs during evaluation loop')
 opt = parser.parse_args()
@@ -42,8 +55,10 @@ def log(msg):
         print(msg)
 
 assert opt.obj in OBJLIST, 'Invalid --obj. Choose from: {}'.format(OBJLIST)
+assert opt.speed > 0,      '--speed must be strictly positive'
 obj_idx  = OBJLIST.index(opt.obj)
-out_dir = os.path.join(opt.output_dir, 'sequence', 'obj{:02d}'.format(opt.obj))
+out_dir  = os.path.join(opt.output_dir, 'sequence', 'obj{:02d}'.format(opt.obj))
+os.makedirs(out_dir, exist_ok=True)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 estimator, refiner = load_models(opt.model, opt.refine_model)
@@ -68,6 +83,7 @@ t_ref_seq    = []
 add_seq      = []
 success_seq  = []
 video_frames = []
+video_ids    = []
 
 for frame_i, fname in enumerate(frame_names):
     img, depth, label, img_arr = load_frame(opt.dataset_root, opt.obj, fname)
@@ -92,22 +108,49 @@ for frame_i, fname in enumerate(frame_names):
 
     frame_bgr = draw_frame_cv2(img_arr, R_pred, t_pred, R_gt, t_gt,
                                 model_pts, bbox, add_val, threshold,
-                                frame_i, t_total)
+                                frame_i, t_total,
+                                playback_fps=opt.fps)
     video_frames.append(frame_bgr)
+    video_ids.append(int(fname))
 
     log('Frame {:04d}/{:04d}  t={:.1f}ms  ADD={:.2f}mm  {}'.format(
         frame_i + 1, len(frame_names), t_total,
         add_val * 1000, 'PASS' if success else 'FAIL'))
 
 # ── Save video ────────────────────────────────────────────────────────────────
+# Encoding strategy — fixed-framerate playback at the dataset's native capture
+# rate (--fps, default 30 = Kinect v1). The HUD's inference-time fps reading
+# does *not* drive playback speed; the writer fps does. The test split removes
+# frames reserved for training, so each kept frame is held for
+# (next_id - cur_id) output frames, preserving the original wall-clock timeline.
+# --speed scales those repeat counts (speed < 1 slows the video down, > 1 fast-
+# forwards) without changing the encoded framerate, which keeps the file valid
+# in every player.
 video_path = os.path.join(out_dir, 'livefeed.mp4')
 h, w = video_frames[0].shape[:2]
 writer = cv2.VideoWriter(video_path,
-    cv2.VideoWriter_fourcc(*'mp4v'), 10, (w, h))
-for f in video_frames:
-    writer.write(f)
+    cv2.VideoWriter_fourcc(*'mp4v'), opt.fps, (w, h))
+
+# Accumulate fractional repeats so a non-integer speed multiplier still
+# converges to the right total duration over the whole sequence (no
+# systematic drift from rounding each frame independently).
+n_written        = 0
+repeat_carry     = 0.0
+for i, frame in enumerate(video_frames):
+    if i + 1 < len(video_ids):
+        native_gap = max(1, video_ids[i + 1] - video_ids[i])
+    else:
+        native_gap = 1
+    target       = native_gap / opt.speed + repeat_carry
+    repeats      = max(1, int(round(target)))
+    repeat_carry = target - repeats
+    for _ in range(repeats):
+        writer.write(frame)
+    n_written += repeats
 writer.release()
-print('Video saved: {}'.format(video_path))
+duration_s = n_written / float(opt.fps)
+print('Video saved: {} ({} frames @ {} fps = {:.1f}s, speed x{:.2f})'.format(
+    video_path, n_written, opt.fps, duration_s, opt.speed))
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 t_tot        = np.array(t_est_seq) + np.array(t_ref_seq)

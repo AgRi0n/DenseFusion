@@ -102,18 +102,21 @@ axes1[0].imshow(img_arr)
 axes1[0].add_patch(patches.Rectangle(
     (cmin, rmin), cmax-cmin, rmax-rmin, linewidth=2, edgecolor='lime',
     facecolor='none', linestyle='--'))
+# Ground-truth 3D bbox only; the predicted bbox is shown in panel 3.
 draw_bbox_3d(axes1[0], bbox_3d_m, R_gt, t_gt, color='lime', lw=1.5)
-draw_bbox_3d(axes1[0], bbox_3d_m, R,    t,    color='red',  lw=1.5)
-axes1[0].set_title('RGB input + 2D detection (dashed) & 3D bbox (red=pred, green=GT)')
+axes1[0].set_title('RGB input + 2D detection (dashed) & GT 3D bbox (green)')
 axes1[0].set_xlim(0, img_arr.shape[1])
 axes1[0].set_ylim(img_arr.shape[0], 0)
 axes1[0].axis('off')
 axes1[1].imshow(mask_label, cmap='gray')
 axes1[1].set_title('Segmentation mask (SegNet output)')
 axes1[1].axis('off')
+# 3D bbox + pose axes only, no model-point overlay (cleaner read of the
+# pose against the raw image).
 pose_panel(axes1[2], proj_pred, proj_gt, R, t, R_gt, t_gt,
-           background=img_arr, title='Predicted (red) vs GT (green) — RGB',
-           bbox_3d=bbox_3d_m)
+           background=img_arr,
+           title='3D bbox (red=pred, green=GT) + pose axes — RGB',
+           bbox_3d=bbox_3d_m, show_points=False)
 fig1.tight_layout()
 p1 = os.path.join(out_dir, 'frame{:04d}_overview.png'.format(opt.idx))
 fig1.savefig(p1, dpi=150, bbox_inches='tight')

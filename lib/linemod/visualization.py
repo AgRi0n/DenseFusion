@@ -101,30 +101,74 @@ def draw_bbox_3d(ax, corners_3d, R, t,
 
 # ── Matplotlib helpers ────────────────────────────────────────────────────────
 
-def draw_axes(ax, R, t, length_m=0.05, scale=1.0):
-    """Draw a projected XYZ tricolour pose frame on a matplotlib axis.
+def draw_axes(ax, R, t, length_m=0.05, scale=1.0, frame='camera'):
+    """Draw a projected tricolour pose frame on a matplotlib axis.
 
-    Each axis i is drawn as an arrow from the projected object centre (t)
-    to the projected tip (t + R[:,i] * length_m).
-        X → red    Y → green    Z → blue
+    Two reference frames are supported:
 
-    scale : multiplier on screen-space arrow length.
-            Use ~0.3 for zoomed crop panels to avoid overflow.
+      frame='camera' (default)
+        The arrows follow the camera *optical* frame: +x to image right,
+        +y down, +z into the scene (depth, standard photography convention).
+        The arrows are anchored at the object centre t but their orientation
+        does not depend on R, so they keep a constant attitude across frames
+        while the anchor (O) moves with the object.
+
+      frame='object'
+        The arrows follow the object's own frame, rotated by R and
+        translated by t — i.e. the classical pose-estimation visualisation
+        of the object's local coordinate system.
+
+    Colour and naming conventions (both modes):
+        x → red    y → green    z → blue
+        The origin is marked with a white-filled dot labelled "O".
+
+    Parameters
+    ----------
+    ax       : matplotlib axis
+    R, t     : pose of the object in the camera frame, R (3,3), t (3,)
+    length_m : arrow length in metres (5 cm by default)
+    scale    : screen-space scale on the arrow length. Use ~0.3 for
+               zoomed crop panels to avoid arrows overflowing the panel.
+    frame    : 'camera' or 'object' — see above.
     """
-    origin = project_points(np.zeros((1, 3)), R, t)[0]
-    for i, (color, label) in enumerate(zip(['red', 'green', 'blue'], ['X', 'Y', 'Z'])):
-        tip_3d = (R[:, i] * length_m).reshape(1, 3)
-        tip_2d = project_points(tip_3d, R, t)[0]
-        tip_2d = origin + (tip_2d - origin) * scale
+    if frame == 'camera':
+        R_axes = np.eye(3)
+    elif frame == 'object':
+        R_axes = R
+    else:
+        raise ValueError("frame must be 'camera' or 'object', got {!r}"
+                         .format(frame))
+
+    # Build the four 3D points to project: origin and three axis tips, each
+    # expressed in the frame we want to visualise. project_points then maps
+    # them to camera coordinates via R_axes @ p + t before perspective divide.
+    pts        = np.zeros((4, 3))
+    pts[1, 0]  = length_m   # +x tip
+    pts[2, 1]  = length_m   # +y tip
+    pts[3, 2]  = length_m   # +z tip
+    proj       = project_points(pts, R_axes, t)
+    origin     = proj[0]
+
+    for i, (color, label) in enumerate(zip(['red',  'green', 'blue'],
+                                           ['x',    'y',     'z'])):
+        tip_2d = origin + (proj[i + 1] - origin) * scale
         ax.annotate('', xy=tip_2d, xytext=origin,
                     arrowprops=dict(arrowstyle='->', color=color, lw=2.5))
         ax.text(tip_2d[0], tip_2d[1], label,
                 color=color, fontsize=9, fontweight='bold')
 
+    # Origin marker "O" — small white-filled dot + bold black label so it
+    # reads on both light and dark backgrounds.
+    ax.scatter([origin[0]], [origin[1]], s=24, c='white',
+               edgecolors='black', linewidths=1.1, zorder=6)
+    ax.text(origin[0] + 6, origin[1] - 6, 'O',
+            color='black', fontsize=9, fontweight='bold', zorder=6)
+
 
 def pose_panel(ax, proj_pred, proj_gt, R_pred, t_pred, R_gt, t_gt,
                background, title, mask_label=None, axes_scale=1.0,
-               bbox_3d=None, bbox_lw=1.5):
+               bbox_3d=None, bbox_lw=1.5, axes_frame='camera',
+               show_points=True):
     """Draw one predicted-vs-GT overlay panel.
 
     Parameters
@@ -140,6 +184,17 @@ def pose_panel(ax, proj_pred, proj_gt, R_pred, t_pred, R_gt, t_gt,
         projected under both poses (lime = GT, red = predicted) and overlaid.
     bbox_lw     : float
         Line width for the 3D bbox edges.
+    axes_frame  : 'camera' (default) or 'object'
+        Reference frame used by the XYZ tricolour arrows. See draw_axes().
+        In 'camera' mode the arrows are drawn once at the predicted origin
+        (orientation is constant, so a second copy at the GT origin would
+        be redundant; the translation error is already visible from the
+        lime/red point clouds). In 'object' mode both predicted and GT
+        local frames are drawn to make the rotation error legible.
+    show_points : bool (default True)
+        When False the predicted/ground-truth model-point scatter overlays
+        are skipped, leaving only the background image, the 3D bbox and the
+        pose axes. Useful for an uncluttered "pose + bbox on image" view.
     """
     dark_bg = (background is None)
 
@@ -156,24 +211,35 @@ def pose_panel(ax, proj_pred, proj_gt, R_pred, t_pred, R_gt, t_gt,
                            255.0 * (1.0 - seg[:, :, np.newaxis]))
         ax.imshow(img_display.astype(np.uint8), extent=[0, 640, 480, 0])
 
-    vgt   = _in_frame(proj_gt)
-    vpred = _in_frame(proj_pred)
-    ax.scatter(proj_gt[vgt, 0],     proj_gt[vgt, 1],
-               s=2.5, c='lime', alpha=0.7, linewidths=0, label='Ground truth', zorder=3)
-    ax.scatter(proj_pred[vpred, 0], proj_pred[vpred, 1],
-               s=2.5, c='red',  alpha=0.7, linewidths=0, label='Predicted',     zorder=3)
+    if show_points:
+        vgt   = _in_frame(proj_gt)
+        vpred = _in_frame(proj_pred)
+        ax.scatter(proj_gt[vgt, 0],     proj_gt[vgt, 1],
+                   s=2.5, c='lime', alpha=0.7, linewidths=0,
+                   label='Ground truth', zorder=3)
+        ax.scatter(proj_pred[vpred, 0], proj_pred[vpred, 1],
+                   s=2.5, c='red',  alpha=0.7, linewidths=0,
+                   label='Predicted',     zorder=3)
 
     if bbox_3d is not None:
         draw_bbox_3d(ax, bbox_3d, R_gt,   t_gt,   color='lime', lw=bbox_lw)
         draw_bbox_3d(ax, bbox_3d, R_pred, t_pred, color='red',  lw=bbox_lw)
 
-    draw_axes(ax, R_pred, t_pred, scale=axes_scale)
-    draw_axes(ax, R_gt,   t_gt,   scale=axes_scale)
+    if axes_frame == 'camera':
+        # Constant orientation across frames — drawing the GT copy on top
+        # would just overlay an identical trident slightly offset.
+        draw_axes(ax, R_pred, t_pred, scale=axes_scale, frame='camera')
+    else:
+        draw_axes(ax, R_pred, t_pred, scale=axes_scale, frame='object')
+        draw_axes(ax, R_gt,   t_gt,   scale=axes_scale, frame='object')
 
     lfc = '#111111' if dark_bg else 'white'
     llc = 'white'   if dark_bg else 'black'
-    ax.legend(loc='upper right', fontsize=8, markerscale=6,
-              facecolor=lfc, labelcolor=llc, edgecolor='gray')
+    # Only draw the legend when there is something to label (point clouds).
+    # Without point overlays the legend would be empty and matplotlib warns.
+    if show_points:
+        ax.legend(loc='upper right', fontsize=8, markerscale=6,
+                  facecolor=lfc, labelcolor=llc, edgecolor='gray')
     ax.set_title(title, color='white' if dark_bg else 'black')
     ax.axis('off')
 
@@ -292,14 +358,24 @@ def timing_plots(t_est_seq, t_ref_seq, add_seq, success_seq, threshold_mm,
 # ── OpenCV overlay for video frames ──────────────────────────────────────────
 
 def draw_frame_cv2(img_arr, R_pred, t_pred, R_gt, t_gt,
-                   model_pts, bbox, add_val, threshold, frame_idx, t_total):
+                   model_pts, bbox, add_val, threshold, frame_idx, t_total,
+                   playback_fps=None):
     """Render one composite video frame with OpenCV overlays.
 
     Draws:
       - 2D bounding box (green=PASS, red=FAIL)
-      - Projected model point cloud: GT (green) and predicted (red)
       - 6D pose axes (XYZ arrows) for predicted pose
-      - HUD: frame index, latency, fps, ADD result
+      - HUD: frame index, inference latency, playback fps, ADD result
+
+    Parameters
+    ----------
+    playback_fps : float or None
+        Effective playback framerate of the output video (the rate at which
+        the viewer sees frames advance). Displayed on the HUD as "Playback".
+        If None, the playback line is omitted.
+        Note: this is *not* the inference rate (1000 / t_total). The inference
+        rate measures how fast DenseFusion can process a frame on the GPU and
+        can easily exceed 60 fps, while playback is fixed by the writer fps.
 
     Returns
     -------
@@ -313,32 +389,51 @@ def draw_frame_cv2(img_arr, R_pred, t_pred, R_gt, t_gt,
     box_col = (0, 255, 0) if success else (0, 0, 255)
     cv2.rectangle(out, (cmin, rmin), (cmax, rmax), box_col, 2)
 
-    # Projected model points
-    sample = np.random.choice(len(model_pts), min(300, len(model_pts)), replace=False)
-    pts_s  = model_pts[sample] / 1000.0
-    for R, t, col in [(R_gt, t_gt, (0, 255, 0)), (R_pred, t_pred, (0, 0, 255))]:
-        proj = project_points(pts_s, R, t).astype(int)
-        for u, v in proj:
-            if 0 <= u < 640 and 0 <= v < 480:
-                cv2.circle(out, (u, v), 1, col, -1)
+    # Camera-frame pose axes anchored at the object origin t_pred.
+    #   x (red)   → image right
+    #   y (green) → image down
+    #   z (blue)  → into the scene (optical-axis depth convention)
+    # The arrows keep a constant orientation across frames because we
+    # project from the identity rotation; only the anchor (O) moves with
+    # the object. The z arrow projects very short whenever t_pred lies
+    # near the optical axis — that is correct, depth points away from the
+    # image plane and therefore foreshortens to almost nothing in 2D.
+    length_m = 0.05
+    pts_cam  = np.array([[0.0,      0.0,      0.0     ],
+                         [length_m, 0.0,      0.0     ],   # +x tip
+                         [0.0,      length_m, 0.0     ],   # +y tip
+                         [0.0,      0.0,      length_m]])  # +z tip
+    proj    = project_points(pts_cam, np.eye(3), t_pred).astype(int)
+    origin  = proj[0]
 
-    # 6D pose axes for predicted pose
-    origin = project_points(np.zeros((1, 3)), R_pred, t_pred)[0].astype(int)
-    for i, (col, lbl) in enumerate(zip(
-            [(0, 0, 255), (0, 255, 0), (255, 0, 0)], ['X', 'Y', 'Z'])):
-        tip_3d = (R_pred[:, i] * 0.05).reshape(1, 3)
-        tip    = project_points(tip_3d, R_pred, t_pred)[0].astype(int)
+    # OpenCV is BGR: (0,0,255)=red  (0,255,0)=green  (255,0,0)=blue
+    for tip, col, lbl in [(proj[1], (0, 0, 255), 'x'),
+                          (proj[2], (0, 255, 0), 'y'),
+                          (proj[3], (255, 0, 0), 'z')]:
         cv2.arrowedLine(out, tuple(origin), tuple(tip), col, 2, tipLength=0.3)
+        # Halo + coloured label so it stays legible on any background.
         cv2.putText(out, lbl, tuple(tip),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+        cv2.putText(out, lbl, tuple(tip),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
 
-    # HUD
-    fps = 1000.0 / t_total if t_total > 0 else 0
-    hud = [
-        'Frame {:04d}'.format(frame_idx),
-        '{:.1f} ms  ({:.1f} fps)'.format(t_total, fps),
-        'ADD: {:.2f} mm  [{}]'.format(add_val * 1000, 'PASS' if success else 'FAIL'),
-    ]
+    # Origin marker "O"
+    cv2.circle(out, tuple(origin), 4, (255, 255, 255), -1)
+    cv2.circle(out, tuple(origin), 4, (0, 0, 0), 1)
+    cv2.putText(out, 'O', (origin[0] + 6, origin[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+    cv2.putText(out, 'O', (origin[0] + 6, origin[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+    # HUD — inference latency on its own line; playback fps shown separately
+    # so the viewer doesn't mistake GPU throughput for video playback speed.
+    hud = ['Frame {:04d}'.format(frame_idx),
+           'Inference: {:.1f} ms'.format(t_total)]
+    if playback_fps is not None:
+        hud.append('Playback: {:.0f} fps'.format(playback_fps))
+    hud.append('ADD: {:.2f} mm  [{}]'.format(
+        add_val * 1000, 'PASS' if success else 'FAIL'))
+
     for k, line in enumerate(hud):
         y = 20 + k * 22
         cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
