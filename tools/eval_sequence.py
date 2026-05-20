@@ -23,7 +23,8 @@ from lib.linemod.preprocessing import (load_frame, prepare_input, load_gt,
                                         load_model_pts, load_frame_names,
                                         load_diameter)
 from lib.linemod.metrics       import compute_add
-from lib.linemod.visualization import timing_plots, draw_frame_cv2
+from lib.linemod.visualization import (timing_plots, add_delta_plot,
+                                       draw_frame_cv2)
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -54,6 +55,29 @@ parser.add_argument('--output_format', type=str, default='video',
                          "frames/ subdirectory; 'both' writes both. PNG "
                          "filenames use the original LineMOD frame id "
                          "(frame_XXXX.png) so they line up with the dataset.")
+parser.add_argument('--split',        type=str, default='test',
+                    choices=['test', 'train', 'all'],
+                    help="Which subset of frames to evaluate. 'test' "
+                         "(default) reproduces the original benchmark "
+                         "behaviour. 'all' merges train.txt and test.txt "
+                         "and processes the full capture in numerical id "
+                         "order, which gives a continuous timeline (no "
+                         "training-frame gaps to fill by duplication) and "
+                         "therefore a much smoother video. Note: ADD is "
+                         "computed on every frame, so train frames will "
+                         "report artificially low ADD because the model "
+                         "saw them during training.")
+parser.add_argument('--mask_source',  type=str, default='auto',
+                    choices=['auto', 'segnet', 'gt'],
+                    help="Where to read object masks from. 'auto' "
+                         "(default) uses SegNet predictions for "
+                         "--split=test and ground-truth masks for "
+                         "--split=train or all. 'segnet' forces SegNet "
+                         "outputs (will fail on train frames). 'gt' "
+                         "forces ground-truth masks everywhere — handy if "
+                         "you want a homogeneous mask quality across the "
+                         "whole sequence to isolate pose-estimation "
+                         "performance from segmentation noise.")
 parser.add_argument('--verbose',      action='store_true',
                     help='Print per-frame logs during evaluation loop')
 opt = parser.parse_args()
@@ -65,7 +89,18 @@ def log(msg):
 assert opt.obj in OBJLIST, 'Invalid --obj. Choose from: {}'.format(OBJLIST)
 assert opt.speed > 0,      '--speed must be strictly positive'
 obj_idx  = OBJLIST.index(opt.obj)
-out_dir  = os.path.join(opt.output_dir, 'sequence', 'obj{:02d}'.format(opt.obj))
+
+# Resolve mask source — 'auto' picks SegNet for the test split, GT for any
+# split that includes training frames (since SegNet predictions are only
+# generated for test frames in the LineMOD preprocessed release).
+if opt.mask_source == 'auto':
+    mask_source = 'segnet' if opt.split == 'test' else 'gt'
+else:
+    mask_source = opt.mask_source
+
+# Subdirectory disambiguates outputs of different splits on the same object.
+out_dir  = os.path.join(opt.output_dir, 'sequence',
+                        'obj{:02d}_{}'.format(opt.obj, opt.split))
 os.makedirs(out_dir, exist_ok=True)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -75,7 +110,7 @@ warmup_gpu(estimator)
 model_pts    = load_model_pts(opt.dataset_root, opt.obj)
 diameter_mm  = load_diameter(opt.obj)
 threshold    = diameter_mm / 1000.0 * 0.1
-frame_names  = load_frame_names(opt.dataset_root, opt.obj)
+frame_names  = load_frame_names(opt.dataset_root, opt.obj, split=opt.split)
 idx_t        = torch.LongTensor([obj_idx]).cuda()
 
 # Pre-load full gt.yml once for the sequence
@@ -83,7 +118,8 @@ with open('{0}/data/{1}/gt.yml'.format(
         opt.dataset_root, '%02d' % opt.obj), 'r') as f:
     gt_cache = yaml.load(f, Loader=yaml.SafeLoader)
 
-print('Object {:02d} — {} test frames'.format(opt.obj, len(frame_names)))
+print('Object {:02d} — {} frames (split={}, mask={})'.format(
+    opt.obj, len(frame_names), opt.split, mask_source))
 
 # ── Sequence loop ─────────────────────────────────────────────────────────────
 t_est_seq    = []
@@ -94,7 +130,8 @@ video_frames = []
 video_ids    = []
 
 for frame_i, fname in enumerate(frame_names):
-    img, depth, label, img_arr = load_frame(opt.dataset_root, opt.obj, fname)
+    img, depth, label, img_arr = load_frame(opt.dataset_root, opt.obj, fname,
+                                            mask_source=mask_source)
     result = prepare_input(img, depth, label)
     if result is None:
         print('Frame {} — empty mask, skipped'.format(fname))
@@ -197,10 +234,16 @@ for label, arr in [('Estimator (ms)', np.array(t_est_seq)),
 print('Achievable fps (median / p95): {:.1f} / {:.1f}'.format(
     1000/np.median(t_tot), 1000/np.percentile(t_tot, 95)))
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
-plot_title = ('DenseFusion — Object {:02d} sequence  |  {} frames  |  '
-              'success {:.1f}%  |  median {:.1f} ms ({:.1f} fps)').format(
-    opt.obj, len(t_tot), success_rate,
+# ── Plots ─────────────────────────────────────────────────────────────────────
+# When the split includes training frames, flag it in the title so readers
+# don't take the success rate at face value (the model saw those frames).
+split_tag  = '[split={}]'.format(opt.split)
+train_warn = '  (includes train frames — ADD biased low)' \
+             if opt.split != 'test' else ''
+
+plot_title = ('DenseFusion — Object {:02d} {} sequence  |  {} frames  |  '
+              'success {:.1f}%{}  |  median {:.1f} ms ({:.1f} fps)').format(
+    opt.obj, split_tag, len(t_tot), success_rate, train_warn,
     np.median(t_tot), 1000/np.median(t_tot))
 
 plot_path = os.path.join(out_dir, 'performance.png')
@@ -208,3 +251,13 @@ timing_plots(t_est_seq, t_ref_seq, add_seq, success_seq,
              diameter_mm * 0.1,
              plot_title,
              plot_path)
+
+# Standalone Δ ADD evolution chart — saved separately so it can be inspected
+# at full width without competing with the 4-panel performance figure.
+delta_title = ('DenseFusion — Object {:02d} {}  Δ ADD evolution  |  {} '
+               'frames  |  success {:.1f}%{}  |  threshold {:.2f} mm').format(
+    opt.obj, split_tag, len(add_seq), success_rate, train_warn,
+    diameter_mm * 0.1)
+delta_path  = os.path.join(out_dir, 'add_delta.png')
+add_delta_plot(add_seq, success_seq, diameter_mm * 0.1,
+               delta_title, delta_path)

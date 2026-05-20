@@ -22,8 +22,43 @@ from lib.linemod.config import (
 from datasets.linemod.dataset import get_bbox, mask_to_bbox, ply_vtx
 
 
-def load_frame(dataset_root, obj, frame_name):
-    """Load RGB, depth and segnet label for one frame.
+def _load_mask(path):
+    """Load a binary object mask from disk and normalise it to [H, W] uint8
+    with 255 marking object pixels.
+
+    LineMOD ships two mask formats:
+      - SegNet predictions (segnet_results/<obj>_label/<fname>_label.png) —
+        single-channel grayscale, 255 = object.
+      - Ground-truth masks (data/<obj>/mask/<fname>.png) — sometimes
+        grayscale (255 = object), sometimes RGB ((255,255,255) = object,
+        which is how the original training dataset code reads them).
+    This helper accepts either and always returns the grayscale convention
+    so the downstream code in prepare_input() only has to handle one case.
+    """
+    img = np.array(Image.open(path))
+    if img.ndim == 3:
+        # RGB ground-truth mask — fold to grayscale on white pixels.
+        white = ((img[:, :, 0] == 255) &
+                 (img[:, :, 1] == 255) &
+                 (img[:, :, 2] == 255))
+        return (white.astype(np.uint8) * 255)
+    return img.astype(np.uint8)
+
+
+def load_frame(dataset_root, obj, frame_name, mask_source='segnet'):
+    """Load RGB, depth and object mask for one frame.
+
+    Parameters
+    ----------
+    mask_source : 'segnet' (default) or 'gt'
+        - 'segnet' reads the SegNet prediction at
+              segnet_results/<obj>_label/<fname>_label.png
+          (only present for the test split — what eval_linemod_bench uses).
+        - 'gt' reads the ground-truth mask at
+              data/<obj>/mask/<fname>.png
+          (present for every frame, train and test). Use this when running
+          on the union of train+test so the mask quality stays uniform
+          across the sequence.
 
     Returns
     -------
@@ -36,12 +71,20 @@ def load_frame(dataset_root, obj, frame_name):
         dataset_root, '%02d' % obj, frame_name)
     depth_path = '{0}/data/{1}/depth/{2}.png'.format(
         dataset_root, '%02d' % obj, frame_name)
-    label_path = '{0}/segnet_results/{1}_label/{2}_label.png'.format(
-        dataset_root, '%02d' % obj, frame_name)
 
-    img   = Image.open(rgb_path)
-    depth = np.array(Image.open(depth_path))
-    label = np.array(Image.open(label_path))
+    if mask_source == 'segnet':
+        label_path = '{0}/segnet_results/{1}_label/{2}_label.png'.format(
+            dataset_root, '%02d' % obj, frame_name)
+    elif mask_source == 'gt':
+        label_path = '{0}/data/{1}/mask/{2}.png'.format(
+            dataset_root, '%02d' % obj, frame_name)
+    else:
+        raise ValueError("mask_source must be 'segnet' or 'gt', got {!r}"
+                         .format(mask_source))
+
+    img     = Image.open(rgb_path)
+    depth   = np.array(Image.open(depth_path))
+    label   = _load_mask(label_path)
     img_arr = np.array(img)[:, :, :3]
 
     return img, depth, label, img_arr
@@ -145,10 +188,65 @@ def load_model_pts(dataset_root, obj):
 
 
 def load_frame_names(dataset_root, obj, split='test'):
-    """Return ordered list of frame name strings from test.txt or train.txt."""
-    path = '{0}/data/{1}/{2}.txt'.format(dataset_root, '%02d' % obj, split)
-    with open(path, 'r') as f:
-        return [l.strip() for l in f if l.strip()]
+    """Return an ordered list of frame name strings for the requested split.
+
+    Parameters
+    ----------
+    split : 'test' | 'train' | 'all'
+        - 'test'  : just test.txt, in file order.
+        - 'train' : just train.txt, in file order.
+        - 'all'   : union of train.txt and test.txt, sorted numerically by
+                    LineMOD frame id (deduped). This produces the natural
+                    capture order the camera recorded the sequence in,
+                    with no gaps — useful for fluid replay over the whole
+                    sequence rather than the sparse test-only timeline.
+    """
+    def _read(path):
+        with open(path, 'r') as f:
+            return [l.strip() for l in f if l.strip()]
+
+    if split in ('test', 'train'):
+        path = '{0}/data/{1}/{2}.txt'.format(dataset_root, '%02d' % obj, split)
+        return _read(path)
+
+    if split == 'all':
+        train_path = '{0}/data/{1}/train.txt'.format(dataset_root, '%02d' % obj)
+        test_path  = '{0}/data/{1}/test.txt'.format( dataset_root, '%02d' % obj)
+        # Use set() for dedup (rare overlap is harmless), then sort by the
+        # integer id so the resulting timeline matches the capture order.
+        merged = set(_read(train_path)) | set(_read(test_path))
+        return sorted(merged, key=lambda s: int(s))
+
+    raise ValueError("split must be 'test', 'train' or 'all', got {!r}"
+                     .format(split))
+
+
+def load_frame_names_with_origin(dataset_root, obj, split='all'):
+    """Same as load_frame_names() but also returns which split each frame
+    came from.
+
+    Returns
+    -------
+    names   : list[str]  — ordered frame name strings
+    origins : list[str]  — parallel list, each entry is 'train' or 'test'
+
+    Useful when downstream code (e.g. HUD overlays, ADD plots) wants to
+    distinguish train frames from test frames visually.
+    """
+    def _read(path):
+        with open(path, 'r') as f:
+            return [l.strip() for l in f if l.strip()]
+
+    train_set = set(_read('{0}/data/{1}/train.txt'.format(
+        dataset_root, '%02d' % obj)))
+    test_set  = set(_read('{0}/data/{1}/test.txt'.format(
+        dataset_root, '%02d' % obj)))
+    names     = load_frame_names(dataset_root, obj, split=split)
+    # If a frame appears in both files (extremely unlikely on LineMOD but
+    # possible after a re-split), prefer the 'test' label as the more
+    # informative one for evaluation.
+    origins   = ['test' if n in test_set else 'train' for n in names]
+    return names, origins
 
 
 def load_diameter(obj, dataset_config_dir='datasets/linemod/dataset_config'):

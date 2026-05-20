@@ -355,6 +355,99 @@ def timing_plots(t_est_seq, t_ref_seq, add_seq, success_seq, threshold_mm,
     plt.close()
 
 
+# ── Delta-ADD evolution plot ──────────────────────────────────────────────────
+
+def add_delta_plot(add_seq, success_seq, threshold_mm, title, output_path):
+    """Single-panel plot of frame-to-frame ADD change over the sequence.
+
+    Layout (one axis, full width, *two* Y scales):
+      - Left Y axis  : Δ ADD = ADD[i] − ADD[i-1], signed (mm). The first
+                       frame has no predecessor, so its delta is set to 0.
+                         positive → pose error grew (tracker drifting)
+                         negative → pose error shrank (tracker recovering)
+                       Bars are coloured green if frame i is PASS, red if
+                       FAIL — same convention as the ADD timeline panel in
+                       timing_plots() so both figures read in tandem.
+                       ±threshold_mm (dashed grey) mark the ADD success
+                       threshold; a single-frame delta larger than this is
+                       enough on its own to flip a PASS into a FAIL.
+      - Right Y axis : rolling mean of Δ ADD on its own scale, so smoothed
+                       trends remain readable even when isolated spikes
+                       dominate the bar range. A solid black baseline at 0
+                       is shared by both axes (means and bars are zero in
+                       the same place by construction).
+
+    Parameters
+    ----------
+    add_seq      : list[float] — per-frame ADD distance in mm
+    success_seq  : list[int]   — per-frame PASS(1) / FAIL(0) flag
+    threshold_mm : float       — ADD success threshold (= 0.1 × diameter)
+    title        : str         — figure suptitle
+    output_path  : str         — destination file (.png recommended)
+    """
+    add_arr = np.array(add_seq, dtype=float)
+    if add_arr.size == 0:
+        raise ValueError('add_delta_plot: empty add_seq')
+
+    # First frame has no predecessor → keep arrays aligned with success_seq
+    # by setting delta[0] = 0 rather than dropping it.
+    delta   = np.concatenate(([0.0], np.diff(add_arr)))
+    frames  = np.arange(len(delta))
+    window  = max(1, len(delta) // 20)
+    colors  = ['green' if s else 'red' for s in success_seq]
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 5), facecolor='white')
+    fig.suptitle(title, fontsize=12)
+
+    # Primary axis — raw deltas (bars) + threshold references
+    ax.bar(frames, delta, color=colors, alpha=0.6, width=1.0,
+           label='_nolegend_')
+    ax.axhline(0, color='black', linewidth=1.0)
+    ax.axhline( threshold_mm, color='gray', linestyle='--', linewidth=1.2,
+               label='+threshold ({:+.2f} mm)'.format( threshold_mm))
+    ax.axhline(-threshold_mm, color='gray', linestyle='--', linewidth=1.2,
+               label='-threshold ({:+.2f} mm)'.format(-threshold_mm))
+    ax.set_xlabel('Frame index')
+    ax.set_ylabel(r'$\Delta$ ADD per frame (mm)')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.margins(x=0)
+
+    # Secondary axis — rolling mean on its own scale so smoothing-scale
+    # trends stay legible even when bar spikes dominate the primary range.
+    # The mean is bounded by max|delta| (centred window), so its dynamic
+    # range is typically one to two orders of magnitude smaller than the
+    # raw bars; sharing the y-axis flattens it visually.
+    ax_mean = ax.twinx()
+    rolling = np.convolve(delta, np.ones(window) / window, mode='same')
+    mean_line, = ax_mean.plot(frames, rolling, color='navy', linewidth=1.8,
+                              label='Rolling mean ({}-frame window)'.format(window))
+    ax_mean.axhline(0, color='navy', linewidth=0.5, alpha=0.3)
+    ax_mean.set_ylabel(r'$\Delta$ ADD rolling mean (mm)', color='navy')
+    ax_mean.tick_params(axis='y', labelcolor='navy')
+    # Symmetric range around 0 so positive and negative drift read the same.
+    mean_abs_max = float(np.max(np.abs(rolling))) if rolling.size else 1.0
+    pad          = max(mean_abs_max * 1.15, 1e-6)
+    ax_mean.set_ylim(-pad, pad)
+
+    # Synthetic legend entries for the PASS/FAIL colour code so the reader
+    # doesn't have to infer it from the bars alone. Combine handles from
+    # both axes into a single legend.
+    from matplotlib.patches import Patch
+    bar_handles  = [Patch(facecolor='green', alpha=0.6, label='PASS frame'),
+                    Patch(facecolor='red',   alpha=0.6, label='FAIL frame')]
+    line_h, line_l = ax.get_legend_handles_labels()
+    mean_h, mean_l = ax_mean.get_legend_handles_labels()
+    handles = bar_handles + line_h + mean_h
+    labels  = ['PASS frame', 'FAIL frame'] + line_l + mean_l
+    ax.legend(handles, labels, fontsize=8, loc='upper right')
+
+    plt.subplots_adjust(left=0.07, right=0.93, top=0.88, bottom=0.12)
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print('Plot saved: {}'.format(output_path))
+    plt.close()
+
+
 # ── OpenCV overlay for video frames ──────────────────────────────────────────
 
 def draw_frame_cv2(img_arr, R_pred, t_pred, R_gt, t_gt,
