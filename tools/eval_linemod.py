@@ -14,13 +14,11 @@ import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-from torch.autograd import Variable
 from datasets.linemod.dataset import PoseDataset as PoseDataset_linemod
 from lib.network import PoseNet, PoseRefineNet
 from lib.loss import Loss
 from lib.loss_refiner import Loss_refine
 from lib.transformations import euler_matrix, quaternion_matrix, quaternion_from_matrix
-from lib.knn.__init__ import KNearestNeighbor
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset_root', type=str, default = '', help='dataset root dir')
@@ -35,8 +33,6 @@ iteration = 4
 bs = 1
 dataset_config_dir = 'datasets/linemod/dataset_config'
 output_result_dir = 'experiments/eval_result/linemod'
-knn = KNearestNeighbor(1)
-
 estimator = PoseNet(num_points = num_points, num_obj = num_objects)
 estimator.cuda()
 refiner = PoseRefineNet(num_points = num_points, num_obj = num_objects)
@@ -56,7 +52,7 @@ criterion_refine = Loss_refine(num_points_mesh, sym_list)
 
 diameter = []
 meta_file = open('{0}/models_info.yml'.format(dataset_config_dir), 'r')
-meta = yaml.load(meta_file)
+meta = yaml.load(meta_file, Loader=yaml.SafeLoader)
 for obj in objlist:
     diameter.append(meta[obj]['diameter'] / 1000.0 * 0.1)
 print(diameter)
@@ -71,12 +67,12 @@ for i, data in enumerate(testdataloader, 0):
         print('No.{0} NOT Pass! Lost detection!'.format(i))
         fw.write('No.{0} NOT Pass! Lost detection!\n'.format(i))
         continue
-    points, choose, img, target, model_points, idx = Variable(points).cuda(), \
-                                                     Variable(choose).cuda(), \
-                                                     Variable(img).cuda(), \
-                                                     Variable(target).cuda(), \
-                                                     Variable(model_points).cuda(), \
-                                                     Variable(idx).cuda()
+    points, choose, img, target, model_points, idx = points.cuda(), \
+                                                     choose.cuda(), \
+                                                     img.cuda(), \
+                                                     target.cuda(), \
+                                                     model_points.cuda(), \
+                                                     idx.cuda()
 
     pred_r, pred_t, pred_c, emb = estimator(img, points, choose, idx)
     pred_r = pred_r / torch.norm(pred_r, dim=2).view(1, num_points, 1)
@@ -89,9 +85,9 @@ for i, data in enumerate(testdataloader, 0):
     my_pred = np.append(my_r, my_t)
 
     for ite in range(0, iteration):
-        T = Variable(torch.from_numpy(my_t.astype(np.float32))).cuda().view(1, 3).repeat(num_points, 1).contiguous().view(1, num_points, 3)
+        T = torch.from_numpy(my_t.astype(np.float32)).cuda().view(1, 3).repeat(num_points, 1).contiguous().view(1, num_points, 3)
         my_mat = quaternion_matrix(my_r)
-        R = Variable(torch.from_numpy(my_mat[:3, :3].astype(np.float32))).cuda().view(1, 3, 3)
+        R = torch.from_numpy(my_mat[:3, :3].astype(np.float32)).cuda().view(1, 3, 3)
         my_mat[0:3, 3] = my_t
         
         new_points = torch.bmm((points - T), R).contiguous()
@@ -123,8 +119,8 @@ for i, data in enumerate(testdataloader, 0):
     if idx[0].item() in sym_list:
         pred = torch.from_numpy(pred.astype(np.float32)).cuda().transpose(1, 0).contiguous()
         target = torch.from_numpy(target.astype(np.float32)).cuda().transpose(1, 0).contiguous()
-        inds = knn(target.unsqueeze(0), pred.unsqueeze(0))
-        target = torch.index_select(target, 1, inds.view(-1) - 1)
+        inds = torch.cdist(pred.transpose(0,1).unsqueeze(0), target.transpose(0,1).unsqueeze(0)).argmin(dim=2)  # 0-based
+        target = torch.index_select(target, 1, inds.view(-1))
         dis = torch.mean(torch.norm((pred.transpose(1, 0) - target.transpose(1, 0)), dim=1), dim=0).item()
     else:
         dis = np.mean(np.linalg.norm(pred - target, axis=1))
