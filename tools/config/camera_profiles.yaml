@@ -1,0 +1,75 @@
+# camera_profiles.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Camera configuration profiles for demo_custom.py.
+#
+# Switch sensor by passing --profile <name> on the command line.
+# Any individual parameter can still be overridden via its own CLI flag.
+#
+# ⚠ Convention for RGB_intrinsics (HoloLens 2 / HL2SS):
+#   alignDepth2RGB.py stores the matrix as rgb_intrinsics.transpose()
+#   where rgb_intrinsics[:3,:3] = cameraIntrinsics.T (= standard K).
+#   Therefore npz['RGB_intrinsics'][:3,:3] = K^T:
+#       fx = K^T[0,0]   fy = K^T[1,1]
+#       cx = K^T[2,0]   cy = K^T[2,1]   ← NOT [0,2] / [1,2]
+# ─────────────────────────────────────────────────────────────────────────────
+
+default: hololens2_ahat
+
+profiles:
+
+  # ── HoloLens 2 / AHAT ──────────────────────────────────────────────────────
+  hololens2_ahat:
+    description: >
+      HoloLens 2 AHAT ToF depth aligned to RGB PV camera (960x540).
+      Produced by alignDepth2RGB.py / DataReaderAlignment.
+
+    img_width:  960
+    img_height: 540
+
+    # null → read from npz['RGB_intrinsics'] at runtime
+    cam_fx: null
+    cam_fy: null
+    cam_cx: null
+    cam_cy: null
+
+    # Depth is float32, values in metres (output of hl2ss rm_depth_normalize)
+    depth_in_metres: true
+
+    # NPZ keys (output of np.savez_compressed in alignDepth2RGB.py)
+    npz_depth_key:       depth          # float32 (H, W) — aligned depth in metres
+    npz_depth_mask_key:  mask           # bool    (H, W) — True where depth is valid
+    npz_intrinsics_key:  RGB_intrinsics # float32 (4, 4) — K^T in top-left 3x3
+    npz_coords_key:      coords         # int32   (N, 2) — [row, col] of valid pixels
+    npz_points3d_key:    points3D_RGBcam # float32 (Hd, Wd, 3) — 3D pts in RGB cam frame
+
+    # RGB: separate PNG file (not embedded in the npz)
+    rgb_in_npz: false
+    npz_rgb_key: null
+    # Auto-discovery pattern (same directory as npz, {frame_id} = trailing number)
+    rgb_file_pattern: "RGB_img-{frame_id}.png"
+
+  # ── LineMOD / PrimeSense ───────────────────────────────────────────────────
+  linemod:
+    description: >
+      LineMOD benchmark, PrimeSense RGBD (640x480).
+      NPZ produced by a custom exporter from LineMOD PNGs.
+
+    img_width:  640
+    img_height: 480
+
+    cam_fx: 572.41140
+    cam_fy: 573.57043
+    cam_cx: 325.26110
+    cam_cy: 242.04899
+
+    depth_in_metres: false     # uint16 mm → divide by 1000
+
+    npz_depth_key:      depth
+    npz_depth_mask_key: null   # recomputed as depth != 0
+    npz_intrinsics_key: null
+    npz_coords_key:     null
+    npz_points3d_key:   null
+
+    rgb_in_npz: true
+    npz_rgb_key: rgb            # uint8 (H, W, 3)
+    rgb_file_pattern: null

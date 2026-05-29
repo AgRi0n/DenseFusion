@@ -1,5 +1,6 @@
 datasets/linemod/Linemod_preprocessed
 datasets/ycb/YCB_Video_Dataset
+datasets/custom
 demo_out/*.png
 *.zip
 *__pycache__
